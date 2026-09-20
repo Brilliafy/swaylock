@@ -87,6 +87,7 @@ struct swaylock_state {
 	struct wl_subcompositor *subcompositor;
 	struct wl_shm *shm;
 	struct wl_list surfaces;
+	struct wl_list seats;
 	struct wl_list images;
 	struct swaylock_args args;
 	struct swaylock_password password;
@@ -112,8 +113,10 @@ struct swaylock_surface {
 	struct wl_subsurface *subsurface;
 	struct ext_session_lock_surface_v1 *ext_session_lock_surface_v1;
 	struct pool_buffer indicator_buffers[2];
+	struct pool_buffer background_buffer;
 	bool created;
 	bool dirty;
+	bool force_buffer_attach;
 	uint32_t width, height;
 	int32_t scale;
 	enum wl_output_subpixel subpixel;
@@ -121,7 +124,7 @@ struct swaylock_surface {
 	struct wl_list link;
 	struct wl_callback *frame;
 	// Dimensions of last wl_buffer committed to background surface
-	int last_buffer_width, last_buffer_height;
+	uint32_t last_buffer_width, last_buffer_height;
 };
 
 // There is exactly one swaylock_image for each -i argument

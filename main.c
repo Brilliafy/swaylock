@@ -94,24 +94,56 @@ static void daemonize(void) {
 static void destroy_surface(struct swaylock_surface *surface) {
 	if (surface->frame != NULL) {
 		wl_callback_destroy(surface->frame);
+		surface->frame = NULL;
 	}
 	wl_list_remove(&surface->link);
 	if (surface->ext_session_lock_surface_v1 != NULL) {
 		ext_session_lock_surface_v1_destroy(surface->ext_session_lock_surface_v1);
+		surface->ext_session_lock_surface_v1 = NULL;
 	}
 	if (surface->subsurface) {
 		wl_subsurface_destroy(surface->subsurface);
+		surface->subsurface = NULL;
 	}
 	if (surface->child) {
 		wl_surface_destroy(surface->child);
+		surface->child = NULL;
 	}
 	if (surface->surface != NULL) {
 		wl_surface_destroy(surface->surface);
+		surface->surface = NULL;
 	}
 	destroy_buffer(&surface->indicator_buffers[0]);
 	destroy_buffer(&surface->indicator_buffers[1]);
-	wl_output_release(surface->output);
+	destroy_buffer(&surface->background_buffer);
+	if (surface->output != NULL) {
+		wl_output_set_user_data(surface->output, NULL);
+		wl_output_release(surface->output);
+		surface->output = NULL;
+	}
+	free(surface->output_name);
 	free(surface);
+}
+
+static void destroy_seat(struct swaylock_seat *seat) {
+	if (seat->repeat_timer) {
+		loop_remove_timer(seat->state->eventloop, seat->repeat_timer);
+		seat->repeat_timer = NULL;
+	}
+	if (seat->pointer) {
+		wl_pointer_release(seat->pointer);
+		seat->pointer = NULL;
+	}
+	if (seat->keyboard) {
+		wl_keyboard_release(seat->keyboard);
+		seat->keyboard = NULL;
+	}
+	wl_list_remove(&seat->link);
+	if (seat->seat) {
+		wl_seat_release(seat->seat);
+		seat->seat = NULL;
+	}
+	free(seat);
 }
 
 static const struct ext_session_lock_surface_v1_listener ext_session_lock_surface_v1_listener;
@@ -162,9 +194,22 @@ static void ext_session_lock_surface_v1_handle_configure(void *data,
 		struct ext_session_lock_surface_v1 *lock_surface, uint32_t serial,
 		uint32_t width, uint32_t height) {
 	struct swaylock_surface *surface = data;
+	if (!surface) {
+		return;
+	}
 	surface->width = width;
 	surface->height = height;
 	ext_session_lock_surface_v1_ack_configure(lock_surface, serial);
+
+	// A configure event acknowledges new surface state. If a frame callback was
+	// lingering from before the output went idle/suspended, cancel it so render()
+	// can immediately commit the required buffer without deadlocking.
+	if (surface->frame != NULL) {
+		wl_callback_destroy(surface->frame);
+		surface->frame = NULL;
+	}
+
+	surface->force_buffer_attach = true;
 	surface->dirty = true;
 	render(surface);
 }
@@ -186,8 +231,11 @@ static void handle_wl_output_geometry(void *data, struct wl_output *wl_output,
 		int32_t subpixel, const char *make, const char *model,
 		int32_t transform) {
 	struct swaylock_surface *surface = data;
+	if (!surface) {
+		return;
+	}
 	surface->subpixel = subpixel;
-	if (surface->state->run_display) {
+	if (surface->state->run_display && !surface->frame) {
 		surface->dirty = true;
 		render(surface);
 	}
@@ -200,6 +248,9 @@ static void handle_wl_output_mode(void *data, struct wl_output *output,
 
 static void handle_wl_output_done(void *data, struct wl_output *output) {
 	struct swaylock_surface *surface = data;
+	if (!surface) {
+		return;
+	}
 	if (!surface->created && surface->state->run_display) {
 		create_surface(surface);
 	}
@@ -208,9 +259,15 @@ static void handle_wl_output_done(void *data, struct wl_output *output) {
 static void handle_wl_output_scale(void *data, struct wl_output *output,
 		int32_t factor) {
 	struct swaylock_surface *surface = data;
+	if (!surface) {
+		return;
+	}
 	surface->scale = factor;
-	if (surface->state->run_display) {
-		surface->dirty = true;
+	// When ext_session_lock_surface_v1 is active, the compositor will send a
+	// configure event with the matching surface-local dimensions. Rendering
+	// immediately before that configure event causes dimensions mismatch errors.
+	surface->dirty = true;
+	if (!surface->ext_session_lock_surface_v1 && surface->state->run_display && !surface->frame) {
 		render(surface);
 	}
 }
@@ -218,6 +275,10 @@ static void handle_wl_output_scale(void *data, struct wl_output *output,
 static void handle_wl_output_name(void *data, struct wl_output *output,
 		const char *name) {
 	struct swaylock_surface *surface = data;
+	if (!surface) {
+		return;
+	}
+	free(surface->output_name);
 	surface->output_name = strdup(name);
 }
 
@@ -269,7 +330,10 @@ static void handle_global(void *data, struct wl_registry *registry,
 		struct swaylock_seat *swaylock_seat =
 			calloc(1, sizeof(struct swaylock_seat));
 		swaylock_seat->state = state;
+		swaylock_seat->seat = seat;
+		swaylock_seat->global_name = name;
 		wl_seat_add_listener(seat, &seat_listener, swaylock_seat);
+		wl_list_insert(&state->seats, &swaylock_seat->link);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct swaylock_surface *surface =
 			calloc(1, sizeof(struct swaylock_surface));
@@ -288,10 +352,17 @@ static void handle_global(void *data, struct wl_registry *registry,
 static void handle_global_remove(void *data, struct wl_registry *registry,
 		uint32_t name) {
 	struct swaylock_state *state = data;
-	struct swaylock_surface *surface;
-	wl_list_for_each(surface, &state->surfaces, link) {
+	struct swaylock_surface *surface, *tmp_surface;
+	wl_list_for_each_safe(surface, tmp_surface, &state->surfaces, link) {
 		if (surface->output_global_name == name) {
 			destroy_surface(surface);
+			break;
+		}
+	}
+	struct swaylock_seat *seat, *tmp_seat;
+	wl_list_for_each_safe(seat, tmp_seat, &state->seats, link) {
+		if (seat->global_name == name) {
+			destroy_seat(seat);
 			break;
 		}
 	}
@@ -1170,6 +1241,7 @@ int main(int argc, char **argv) {
 	}
 
 	wl_list_init(&state.surfaces);
+	wl_list_init(&state.seats);
 	state.xkb.context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	state.display = wl_display_connect(NULL);
 	if (!state.display) {
@@ -1268,6 +1340,16 @@ int main(int argc, char **argv) {
 
 	ext_session_lock_v1_unlock_and_destroy(state.ext_session_lock_v1);
 	wl_display_roundtrip(state.display);
+
+	struct swaylock_surface *surface_iter, *tmp_surface;
+	wl_list_for_each_safe(surface_iter, tmp_surface, &state.surfaces, link) {
+		destroy_surface(surface_iter);
+	}
+
+	struct swaylock_seat *seat_iter, *tmp_seat;
+	wl_list_for_each_safe(seat_iter, tmp_seat, &state.seats, link) {
+		destroy_seat(seat_iter);
+	}
 
 	free(state.args.font);
 	cairo_destroy(state.test_cairo);

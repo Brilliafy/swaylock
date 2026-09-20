@@ -108,7 +108,10 @@ struct pool_buffer *get_next_buffer(struct wl_shm *shm,
 	}
 
 	if (!buffer) {
-		return NULL;
+		/* If both buffers are marked busy (e.g. after sleep/resume where the compositor
+		 * did not dispatch release events for the previous buffer), fallback to recycling
+		 * the first buffer rather than failing to draw and causing a protocol error. */
+		buffer = &pool[0];
 	}
 
 	if (buffer->width != width || buffer->height != height) {

@@ -15,8 +15,12 @@ struct swaylock_xkb {
 	struct xkb_keymap *keymap;
 };
 
+#include <wayland-client.h>
+
 struct swaylock_seat {
 	struct swaylock_state *state;
+	struct wl_seat *seat;
+	uint32_t global_name;
 	struct wl_pointer *pointer;
 	struct wl_keyboard *keyboard;
 	int32_t repeat_period_ms;
@@ -24,6 +28,7 @@ struct swaylock_seat {
 	uint32_t repeat_sym;
 	uint32_t repeat_codepoint;
 	struct loop_timer *repeat_timer;
+	struct wl_list link;
 };
 
 extern const struct wl_seat_listener seat_listener;

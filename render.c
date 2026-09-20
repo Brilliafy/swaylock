@@ -38,6 +38,9 @@ static void surface_frame_handle_done(void *data, struct wl_callback *callback,
 	struct swaylock_surface *surface = data;
 
 	wl_callback_destroy(callback);
+	if (!surface) {
+		return;
+	}
 	surface->frame = NULL;
 
 	render(surface);
@@ -52,8 +55,8 @@ static bool render_frame(struct swaylock_surface *surface);
 void render(struct swaylock_surface *surface) {
 	struct swaylock_state *state = surface->state;
 
-	int buffer_width = surface->width * surface->scale;
-	int buffer_height = surface->height * surface->scale;
+	uint32_t buffer_width = surface->width * surface->scale;
+	uint32_t buffer_height = surface->height * surface->scale;
 	if (buffer_width == 0 || buffer_height == 0) {
 		return; // not yet configured
 	}
@@ -63,20 +66,20 @@ void render(struct swaylock_surface *surface) {
 		return;
 	}
 
-	bool need_destroy = false;
-	struct pool_buffer buffer;
+	bool need_attach = surface->force_buffer_attach;
 
-	if (buffer_width != surface->last_buffer_width ||
-			buffer_height != surface->last_buffer_height) {
-		need_destroy = true;
-		if (!create_buffer(state->shm, &buffer, buffer_width, buffer_height,
+	if (buffer_width != surface->background_buffer.width ||
+			buffer_height != surface->background_buffer.height ||
+			!surface->background_buffer.buffer) {
+		destroy_buffer(&surface->background_buffer);
+		if (!create_buffer(state->shm, &surface->background_buffer, buffer_width, buffer_height,
 				WL_SHM_FORMAT_ARGB8888)) {
 			swaylock_log(LOG_ERROR,
 				"Failed to create new buffer for frame background.");
 			return;
 		}
 
-		cairo_t *cairo = buffer.cairo;
+		cairo_t *cairo = surface->background_buffer.cairo;
 		cairo_set_antialias(cairo, CAIRO_ANTIALIAS_BEST);
 
 		cairo_save(cairo);
@@ -91,26 +94,27 @@ void render(struct swaylock_surface *surface) {
 		cairo_restore(cairo);
 		cairo_identity_matrix(cairo);
 
-		wl_surface_attach(surface->surface, buffer.buffer, 0, 0);
-		wl_surface_damage_buffer(surface->surface, 0, 0, INT32_MAX, INT32_MAX);
-		need_destroy = true;
-
 		surface->last_buffer_width = buffer_width;
 		surface->last_buffer_height = buffer_height;
+		need_attach = true;
 	}
 
-	// It is possible for the surface scale to change even if the wl_buffer size hasn't
-	wl_surface_set_buffer_scale(surface->surface, surface->scale);
+	if (need_attach) {
+		wl_surface_set_buffer_scale(surface->surface, surface->scale);
+		wl_surface_attach(surface->surface, surface->background_buffer.buffer, 0, 0);
+		wl_surface_damage_buffer(surface->surface, 0, 0, INT32_MAX, INT32_MAX);
+		surface->force_buffer_attach = false;
+	} else {
+		wl_surface_set_buffer_scale(surface->surface, surface->scale);
+	}
 
-	render_frame(surface);
+	if (!render_frame(surface)) {
+		return;
+	}
 	surface->dirty = false;
 	surface->frame = wl_surface_frame(surface->surface);
 	wl_callback_add_listener(surface->frame, &surface_frame_listener, surface);
 	wl_surface_commit(surface->surface);
-
-	if (need_destroy) {
-		destroy_buffer(&buffer);
-	}
 }
 
 static void configure_font_drawing(cairo_t *cairo, struct swaylock_state *state,
